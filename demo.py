@@ -1,4 +1,5 @@
 import os
+import json
 
 import gradio as gr
 import torch
@@ -11,6 +12,7 @@ from transformers.models.vit.modeling_vit import ViTModel
 
 MODEL_NAME = "google/vit-base-patch16-224"
 CHECKPOINT_PATH = os.path.join("outputs", "models", "best_overall.pt")
+RESULTS_PATH = os.path.join("outputs", "results.json")
 
 
 class ViTFakeDetector(nn.Module):
@@ -65,6 +67,45 @@ def load_model_and_transforms():
 MODEL, TRANSFORM, CLASS_NAMES, DEVICE = load_model_and_transforms()
 
 
+def load_results_summary():
+    if not os.path.exists(RESULTS_PATH):
+        return "results.json not found. Run train.py first.", []
+
+    with open(RESULTS_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    best = data.get("best_config", {})
+    final = data.get("final_test_metrics", {})
+    kfold = data.get("kfold_results", {})
+
+    summary = (
+        f"Best Config: {best.get('name', 'N/A')}\n"
+        f"Val Acc: {best.get('best_val_acc', 'N/A')} | Val AUC: {best.get('best_val_auc', 'N/A')}\n"
+        f"Test Acc: {final.get('accuracy', 'N/A')} | Test AUC: {final.get('auc', 'N/A')}\n"
+        f"K-Fold Mean Acc: {kfold.get('mean_accuracy', 'N/A')} ± {kfold.get('std_accuracy', 'N/A')}\n"
+        f"K-Fold Mean AUC: {kfold.get('mean_auc', 'N/A')} ± {kfold.get('std_auc', 'N/A')}"
+    )
+
+    graphs = data.get("graphs", {})
+    preferred_order = [
+        "training_curves",
+        "confusion_matrix",
+        "roc_curve",
+        "precision_recall_curve",
+        "confidence_distribution",
+        "hyperparameter_table",
+        "kfold_table",
+    ]
+
+    image_paths = []
+    for key in preferred_order:
+        p = graphs.get(key)
+        if p and os.path.exists(p):
+            image_paths.append(p)
+
+    return summary, image_paths
+
+
 def predict_image(image: Image.Image):
     if image is None:
         return "Please upload an image.", {}
@@ -91,21 +132,34 @@ def predict_image(image: Image.Image):
 
 
 def main():
-    description = (
-        "Drag and drop any image to classify it as Real or AI-generated using a ViT-based model."
-    )
+    summary_text, graph_images = load_results_summary()
 
-    demo = gr.Interface(
-        fn=predict_image,
-        inputs=gr.Image(type="pil", label="Upload Image"),
-        outputs=[
-            gr.Textbox(label="Prediction"),
-            gr.Label(label="Class Probabilities"),
-        ],
-        title="AI vs Real Image Detector",
-        description=description,
-        allow_flagging="never",
-    )
+    with gr.Blocks(title="AI vs Real Image Detector") as demo:
+        gr.Markdown("# AI vs Real Image Detector")
+        gr.Markdown("Upload an image for prediction, and review the latest training curves and evaluation figures.")
+
+        with gr.Tab("Prediction"):
+            with gr.Row():
+                in_img = gr.Image(type="pil", label="Upload Image")
+                with gr.Column():
+                    out_text = gr.Textbox(label="Prediction")
+                    out_probs = gr.Label(label="Class Probabilities")
+            run_btn = gr.Button("Predict")
+            run_btn.click(fn=predict_image, inputs=in_img, outputs=[out_text, out_probs])
+
+        with gr.Tab("Training Dashboard"):
+            gr.Textbox(value=summary_text, label="Latest Results Summary", lines=7)
+            if graph_images:
+                gr.Gallery(
+                    value=graph_images,
+                    label="Generated Curves and Evaluation Figures",
+                    columns=2,
+                    rows=4,
+                    object_fit="contain",
+                    height="auto",
+                )
+            else:
+                gr.Markdown("No graph files found yet. Run train.py first.")
 
     demo.launch()
 

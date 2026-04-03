@@ -230,6 +230,59 @@ def evaluate_model_and_save_artifacts(
     }
 
 
+def evaluate_from_predictions_and_save_artifacts(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    class_names: List[str],
+    graphs_dir: str,
+) -> Dict:
+    y_pred = np.argmax(y_prob, axis=1)
+
+    accuracy = float(accuracy_score(y_true, y_pred))
+
+    try:
+        auc_score = float(roc_auc_score(y_true, y_prob[:, 1]))
+    except ValueError:
+        auc_score = float("nan")
+
+    report = classification_report(
+        y_true,
+        y_pred,
+        target_names=class_names,
+        output_dict=True,
+        digits=4,
+    )
+
+    cm = confusion_matrix(y_true, y_pred)
+    save_confusion_matrix(cm, class_names, os.path.join(graphs_dir, "confusion_matrix.png"))
+
+    roc_auc = save_roc_curve(
+        y_true,
+        y_prob[:, 1],
+        os.path.join(graphs_dir, "roc_curve.png"),
+    )
+    pr_auc = save_pr_curve(
+        y_true,
+        y_prob[:, 1],
+        os.path.join(graphs_dir, "precision_recall_curve.png"),
+    )
+    save_confidence_distribution(
+        y_true,
+        y_prob[:, 1],
+        class_names,
+        os.path.join(graphs_dir, "confidence_distribution.png"),
+    )
+
+    return {
+        "accuracy": accuracy,
+        "auc": auc_score,
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "confusion_matrix": cm.tolist(),
+        "classification_report": report,
+    }
+
+
 def write_results_json(results: Dict, output_path: str) -> None:
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)

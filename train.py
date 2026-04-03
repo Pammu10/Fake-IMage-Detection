@@ -484,6 +484,12 @@ def main():
         action="store_true",
         help="If running on CPU and max-samples is not set, cap dataset for faster end-to-end run",
     )
+    parser.add_argument(
+        "--test-count",
+        type=int,
+        default=0,
+        help="Exact number of test images to hold out (0 keeps default 15% split)",
+    )
     args = parser.parse_args()
 
     set_seed(SEED)
@@ -508,12 +514,24 @@ def main():
 
     all_indices = np.arange(len(samples))
 
-    train_val_idx, test_idx = train_test_split(
-        all_indices,
-        test_size=0.15,
-        random_state=SEED,
-        stratify=labels,
-    )
+    if args.test_count > 0:
+        if args.test_count >= len(samples):
+            raise ValueError(
+                f"test-count must be smaller than total samples. Got test-count={args.test_count}, total={len(samples)}"
+            )
+        train_val_idx, test_idx = train_test_split(
+            all_indices,
+            test_size=args.test_count,
+            random_state=SEED,
+            stratify=labels,
+        )
+    else:
+        train_val_idx, test_idx = train_test_split(
+            all_indices,
+            test_size=0.15,
+            random_state=SEED,
+            stratify=labels,
+        )
 
     train_idx, val_idx = train_test_split(
         train_val_idx,
