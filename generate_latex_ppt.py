@@ -53,6 +53,13 @@ def main():
         ]
     )
 
+    config_summary = ", ".join(
+      [
+        f"{row['Config']}({row['Learning Rate']}, {row['Batch Size']}, {row['Epochs']})"
+        for row in sweep
+      ]
+    )
+
     kfold_rows = "\n".join(
         [
             f"{row['fold']} & {row['val_accuracy']:.4f} & {row['val_auc']:.4f} \\\\" for row in kf["folds"]
@@ -100,12 +107,13 @@ def main():
 
 \\begin{{frame}}{{Architecture: ViT + Custom Head}}
 \\centering
-\\begin{{tikzpicture}}[node distance=1.8cm, auto, >=latex]
-  \\node[draw, rounded corners, align=center] (in) {{Input\\\\224x224 RGB}};
-  \\node[draw, rounded corners, align=center, right=of in] (vit) {{Frozen ViT\\\\google/vit-base-patch16-224}};
-  \\node[draw, rounded corners, align=center, right=of vit] (cls) {{CLS Token\\\\768-d}};
-  \\node[draw, rounded corners, align=center, right=of cls] (h1) {{Linear 768\\\\$\\to$ 256 + ReLU\\\\+ Dropout(0.3)}};
-  \\node[draw, rounded corners, align=center, right=of h1] (out) {{Linear 256\\\\$\\to$ 2\\\\Real/Fake}};
+\\begin{{tikzpicture}}[scale=0.85, node distance=1.2cm, auto, >=latex]
+  \\tiny
+  \\node[draw, rounded corners, align=center, text width=1.2cm] (in) {{Input\\\\224×224\\\\RGB}};
+  \\node[draw, rounded corners, align=center, right=of in, text width=1.3cm] (vit) {{Frozen ViT\\\\Base}};
+  \\node[draw, rounded corners, align=center, right=of vit, text width=1.2cm] (cls) {{CLS\\\\Token\\\\768-d}};
+  \\node[draw, rounded corners, align=center, right=of cls, text width=1.4cm] (h1) {{Linear 768\\\\$\\to$ 256\\\\+ ReLU + Drop}};
+  \\node[draw, rounded corners, align=center, right=of h1, text width=1.2cm] (out) {{Linear 256\\\\$\\to$ 2\\\\Fake/Real}};
 
   \\draw[->] (in) -- (vit);
   \\draw[->] (vit) -- (cls);
@@ -113,8 +121,8 @@ def main():
   \\draw[->] (h1) -- (out);
 \\end{{tikzpicture}}
 
-\\vspace{{0.4cm}}
-\\small ViT captures global image structure with self-attention. Backbone is frozen; only the small head is trained.
+\\vspace{{0.3cm}}
+\\small ViT backbone frozen; only custom head trained. CLS token summarizes image for classification.
 \\end{{frame}}
 
 \\begin{{frame}}{{Training Setup}}
@@ -122,7 +130,7 @@ def main():
   \\item Loss: {esc(r['training_setup']['loss'])}
   \\item Optimizer: {esc(r['training_setup']['optimizer'])}
   \\item Scheduler: {esc(r['training_setup']['scheduler'])}
-  \\item Configs: A(1e-3,32,10), B(1e-4,32,15), C(1e-4,16,15)
+  \\item Configs from latest run: {esc(config_summary)}
 \\end{{itemize}}
 \\end{{frame}}
 
@@ -183,6 +191,8 @@ Mean$\\pm$Std & {kf['mean_accuracy']:.4f}$\\pm${kf['std_accuracy']:.4f} & {kf['m
   \\item Best config: {esc(best['name'])} (lr={best['lr']}, batch={best['batch_size']}, epochs={best['epochs']})
   \\item Final Test Accuracy: {fm['accuracy']:.4f}
   \\item Final Test AUC: {fm['auc']:.4f}
+  \\item K-Fold Mean Accuracy: {kf['mean_accuracy']:.4f}$\\pm${kf['std_accuracy']:.4f}
+  \\item External OOD Accuracy: {r.get('external_test_metrics', {}).get('accuracy', 0):.4f}
   \\item Model performs strongly with frozen ViT + lightweight classifier head.
   \\item Future work: unfreeze last ViT blocks, stronger augmentations, larger training budget.
 \\end{{itemize}}

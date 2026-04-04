@@ -4,14 +4,14 @@ import datetime
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from PIL import Image
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import accuracy_score, classification_report, f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -119,9 +119,9 @@ def collect_cifake_samples(data_root: str) -> Tuple[List[Tuple[str, int]], List[
                 class_names_set.add(child)
 
     class_names = sorted(class_names_set)
-    if len(class_names) != 2:
+    if len(class_names) < 2:
         raise ValueError(
-            f"Expected exactly 2 class folders, found {len(class_names)}: {class_names}."
+            f"Expected at least 2 class folders, found {len(class_names)}: {class_names}."
         )
 
     class_to_idx = {name: idx for idx, name in enumerate(class_names)}
@@ -142,6 +142,207 @@ def collect_cifake_samples(data_root: str) -> Tuple[List[Tuple[str, int]], List[
         raise ValueError("No image files were found in the dataset path.")
 
     return samples, class_names
+
+
+def collect_samples_from_roots(data_roots: List[str]) -> Tuple[List[Tuple[str, int]], List[str]]:
+    all_samples = []
+    global_class_names = ["FAKE", "REAL"]
+
+    for root in data_roots:
+        samples, class_names = collect_cifake_samples(root)
+        local_to_idx = {name.lower(): i for i, name in enumerate(class_names)}
+
+        fake_local_idx = next(
+            (
+                i
+                for i, name in enumerate(class_names)
+                if any(tok in name.lower() for tok in ["fake", "ai", "generated", "synthetic", "deepfake"])
+            ),
+            None,
+        )
+        real_local_idx = next(
+            (
+                i
+                for i, name in enumerate(class_names)
+                if any(tok in name.lower() for tok in ["real", "authentic", "genuine", "natural"])
+            ),
+            None,
+        )
+
+        if fake_local_idx is None and "fake" in local_to_idx:
+            fake_local_idx = local_to_idx["fake"]
+        if real_local_idx is None and "real" in local_to_idx:
+            real_local_idx = local_to_idx["real"]
+
+        if fake_local_idx is None and real_local_idx is None:
+            # Fallback for unusual names but strict binary datasets.
+            fake_local_idx = 0
+            real_local_idx = 1
+        elif fake_local_idx is None:
+            fake_local_idx = 1 - real_local_idx
+        elif real_local_idx is None:
+            real_local_idx = 1 - fake_local_idx
+
+        for path, local_label in samples:
+            if local_label == fake_local_idx:
+                all_samples.append((path, 0))
+            elif local_label == real_local_idx:
+                all_samples.append((path, 1))
+
+    if not all_samples:
+        raise ValueError("No usable fake/real samples found across provided roots.")
+
+    return all_samples, global_class_names
+
+
+def find_fake_class_index(class_names: List[str]) -> int:
+    for i, name in enumerate(class_names):
+        if "fake" in name.lower():
+            return i
+    return 1
+
+
+def collect_logits_and_labels(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    all_logits = []
+    all_labels = []
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images = images.to(device)
+            logits = model(images)
+            all_logits.append(logits.cpu().numpy())
+            all_labels.append(labels.numpy())
+    return np.concatenate(all_logits, axis=0), np.concatenate(all_labels, axis=0)
+
+
+def fit_temperature_scaling(logits: np.ndarray, labels: np.ndarray, device: torch.device) -> float:
+    logits_t = torch.tensor(logits, dtype=torch.float32, device=device)
+    labels_t = torch.tensor(labels, dtype=torch.long, device=device)
+    temperature = torch.ones(1, device=device, requires_grad=True)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.LBFGS([temperature], lr=0.01, max_iter=100)
+
+    def closure():
+        optimizer.zero_grad()
+        loss = criterion(logits_t / torch.clamp(temperature, min=1e-3), labels_t)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    temp_value = float(torch.clamp(temperature.detach(), min=1e-3).item())
+    return temp_value
+
+
+def softmax_with_temperature(logits: np.ndarray, temperature: float) -> np.ndarray:
+    scaled = logits / max(temperature, 1e-6)
+    scaled = scaled - np.max(scaled, axis=1, keepdims=True)
+    exp = np.exp(scaled)
+    return exp / np.sum(exp, axis=1, keepdims=True)
+
+
+def tune_fake_threshold_from_val(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    fake_idx: int,
+) -> float:
+    y_true_fake = (labels == fake_idx).astype(int)
+    best_threshold = 0.5
+    best_f1 = -1.0
+    for th in np.linspace(0.05, 0.95, 181):
+        y_pred_fake = (probs[:, fake_idx] >= th).astype(int)
+        score = f1_score(y_true_fake, y_pred_fake, zero_division=0)
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = float(th)
+    return best_threshold
+
+
+def ood_threshold_from_val(probs: np.ndarray) -> float:
+    max_conf = probs.max(axis=1)
+    # Low-confidence tail cutoff from validation distribution.
+    return float(np.percentile(max_conf, 5))
+
+
+def evaluate_with_threshold(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    class_names: List[str],
+    fake_idx: int,
+    fake_threshold: float,
+) -> Dict:
+    y_true_fake = (labels == fake_idx).astype(int)
+    y_pred_fake = (probs[:, fake_idx] >= fake_threshold).astype(int)
+
+    # Map fake/real binary prediction back to class index space.
+    pred_idx = np.where(y_pred_fake == 1, fake_idx, 1 - fake_idx)
+
+    accuracy = float(accuracy_score(labels, pred_idx))
+    try:
+        auc_score = float(roc_auc_score(y_true_fake, probs[:, fake_idx]))
+    except ValueError:
+        auc_score = float("nan")
+
+    report = classification_report(
+        labels,
+        pred_idx,
+        target_names=class_names,
+        output_dict=True,
+        digits=4,
+        zero_division=0,
+    )
+
+    return {
+        "accuracy": accuracy,
+        "auc": auc_score,
+        "classification_report": report,
+    }
+
+
+def collect_external_samples(
+    external_root: str,
+    class_names: List[str],
+) -> List[Tuple[str, int]]:
+    class_to_idx = {name.lower(): i for i, name in enumerate(class_names)}
+    fake_idx = class_to_idx.get("fake", class_to_idx.get("ai", 0))
+    real_idx = class_to_idx.get("real", 1)
+    # Common aliases for robustness.
+    aliases = {
+        "fake": fake_idx,
+        "ai": fake_idx,
+        "generated": fake_idx,
+        "synthetic": fake_idx,
+        "real": real_idx,
+        "authentic": real_idx,
+    }
+
+    samples = []
+    for child in os.listdir(external_root):
+        class_dir = os.path.join(external_root, child)
+        if not os.path.isdir(class_dir):
+            continue
+
+        key = child.lower()
+        if key in class_to_idx:
+            label = class_to_idx[key]
+        elif key in aliases:
+            label = aliases[key]
+        elif any(tok in key for tok in ["fake", "generated", "synthetic"]):
+            label = fake_idx
+        elif any(tok in key for tok in ["real", "authentic"]):
+            label = real_idx
+        else:
+            continue
+
+        for root, _, files in os.walk(class_dir):
+            for file in files:
+                if _is_image_file(file):
+                    samples.append((os.path.join(root, file), label))
+
+    return samples
 
 
 def stratified_subsample(samples: List[Tuple[str, int]], max_samples: int, seed: int = SEED) -> List[Tuple[str, int]]:
@@ -375,13 +576,16 @@ def run_kfold(
     class_names: List[str],
     output_dirs: Dict[str, str],
     num_workers: int,
+    n_splits: int = 3,
+    epochs_override: int = 0,
 ):
-    print("\n========== Running 3-Fold Cross Validation ==========")
-    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+    cv_epochs = int(epochs_override) if int(epochs_override) > 0 else int(best_config.epochs)
+    print(f"\n========== Running {n_splits}-Fold Cross Validation ({cv_epochs} epochs/fold) ==========")
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
     fold_results = []
 
     for fold, (tr_idx_local, val_idx_local) in enumerate(skf.split(all_indices, labels[all_indices]), start=1):
-        print(f"\n--- Fold {fold}/3 ---")
+        print(f"\n--- Fold {fold}/{n_splits} ---")
 
         tr_idx = all_indices[tr_idx_local]
         va_idx = all_indices[val_idx_local]
@@ -404,13 +608,13 @@ def run_kfold(
         model = ViTFakeDetector(MODEL_NAME).to(device)
         criterion = nn.CrossEntropyLoss()
         optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=best_config.lr)
-        scheduler = CosineAnnealingLR(optimizer, T_max=best_config.epochs)
+        scheduler = CosineAnnealingLR(optimizer, T_max=cv_epochs)
 
         best_acc = 0.0
         best_auc = 0.0
         best_state = None
 
-        for epoch in range(1, best_config.epochs + 1):
+        for epoch in range(1, cv_epochs + 1):
             train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device)
             val_loss, val_acc, val_auc = validate(model, val_loader, criterion, device)
             scheduler.step()
@@ -421,7 +625,7 @@ def run_kfold(
                 best_state = copy.deepcopy(model.state_dict())
 
             print(
-                f"Fold {fold} Epoch {epoch:02d}/{best_config.epochs} | "
+                f"Fold {fold} Epoch {epoch:02d}/{cv_epochs} | "
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
                 f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_auc={val_auc:.4f}"
             )
@@ -435,7 +639,7 @@ def run_kfold(
                     "name": best_config.name,
                     "lr": best_config.lr,
                     "batch_size": best_config.batch_size,
-                    "epochs": best_config.epochs,
+                    "epochs": cv_epochs,
                 },
                 "model_name": MODEL_NAME,
                 "fold": fold,
@@ -485,10 +689,40 @@ def main():
         help="If running on CPU and max-samples is not set, cap dataset for faster end-to-end run",
     )
     parser.add_argument(
+        "--extra-data-roots",
+        type=str,
+        default="",
+        help="Comma-separated extra dataset roots with same class folder structure to improve diversity",
+    )
+    parser.add_argument(
+        "--external-test-root",
+        type=str,
+        default="",
+        help="Optional external test root (REAL/FAKE folders) for beyond-CIFAKE evaluation",
+    )
+    parser.add_argument(
         "--test-count",
         type=int,
         default=0,
         help="Exact number of test images to hold out (0 keeps default 15% split)",
+    )
+    parser.add_argument(
+        "--epoch-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for sweep epochs (e.g., 0.5 makes 10/15/15 become 5/8/8)",
+    )
+    parser.add_argument(
+        "--kfold-splits",
+        type=int,
+        default=3,
+        help="Number of folds for cross-validation",
+    )
+    parser.add_argument(
+        "--kfold-epochs",
+        type=int,
+        default=0,
+        help="Optional fixed epochs per fold (0 uses best config epochs)",
     )
     args = parser.parse_args()
 
@@ -496,8 +730,13 @@ def main():
     output_dirs = ensure_output_dirs("outputs")
 
     print("Loading dataset samples...")
-    samples, class_names = collect_cifake_samples(args.data_root)
+    data_roots = [args.data_root]
+    if args.extra_data_roots.strip():
+        extra_roots = [x.strip() for x in args.extra_data_roots.split(",") if x.strip()]
+        data_roots.extend(extra_roots)
+    samples, class_names = collect_samples_from_roots(data_roots)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fake_idx = find_fake_class_index(class_names)
 
     if args.max_samples > 0:
         samples = stratified_subsample(samples, args.max_samples, seed=SEED)
@@ -546,10 +785,13 @@ def main():
 
     print(f"Using device: {device}")
 
+    def _scaled_epochs(base_epochs: int) -> int:
+        return max(3, int(round(base_epochs * max(args.epoch_scale, 0.2))))
+
     configs = [
-        Config("Config A", lr=1e-3, batch_size=32, epochs=10),
-        Config("Config B", lr=1e-4, batch_size=32, epochs=15),
-        Config("Config C", lr=1e-4, batch_size=16, epochs=15),
+        Config("Config A", lr=1e-3, batch_size=32, epochs=_scaled_epochs(10)),
+        Config("Config B", lr=1e-4, batch_size=32, epochs=_scaled_epochs(15)),
+        Config("Config C", lr=1e-4, batch_size=16, epochs=_scaled_epochs(15)),
     ]
 
     sweep_results = []
@@ -627,12 +869,40 @@ def main():
         num_workers=args.num_workers,
     )
 
+    # Calibration and threshold tuning using validation split.
+    val_loader_for_calib = create_dataloader(
+        eval_dataset,
+        val_idx,
+        batch_size=best_cfg.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    val_logits, val_labels = collect_logits_and_labels(model, val_loader_for_calib, device)
+    temperature = fit_temperature_scaling(val_logits, val_labels, device)
+    val_probs_cal = softmax_with_temperature(val_logits, temperature)
+    fake_threshold = tune_fake_threshold_from_val(val_probs_cal, val_labels, fake_idx)
+    ood_threshold = ood_threshold_from_val(val_probs_cal)
+    print(
+        f"Calibration complete: temperature={temperature:.4f}, "
+        f"fake_threshold={fake_threshold:.3f}, ood_conf_threshold={ood_threshold:.3f}"
+    )
+
     test_metrics = evaluate_model_and_save_artifacts(
         model=model,
         dataloader=test_loader,
         device=device,
         class_names=class_names,
         graphs_dir=output_dirs["graphs"],
+    )
+
+    test_logits, test_labels = collect_logits_and_labels(model, test_loader, device)
+    test_probs_cal = softmax_with_temperature(test_logits, temperature)
+    thresholded_test_metrics = evaluate_with_threshold(
+        probs=test_probs_cal,
+        labels=test_labels,
+        class_names=class_names,
+        fake_idx=fake_idx,
+        fake_threshold=fake_threshold,
     )
 
     kfold_results = run_kfold(
@@ -645,6 +915,8 @@ def main():
         class_names=class_names,
         output_dirs=output_dirs,
         num_workers=args.num_workers,
+        n_splits=max(2, args.kfold_splits),
+        epochs_override=max(0, args.kfold_epochs),
     )
     kfold_df = pd.DataFrame(
         [
@@ -678,6 +950,36 @@ def main():
         save_path=os.path.join(output_dirs["graphs"], "kfold_results_table.png"),
     )
 
+    external_test_metrics = None
+    if args.external_test_root.strip():
+        print(f"\nEvaluating on external dataset: {args.external_test_root}")
+        if os.path.isdir(args.external_test_root):
+            ext_samples = collect_external_samples(args.external_test_root, class_names)
+            if len(ext_samples) > 0:
+                ext_dataset = CIFAKEDataset(ext_samples, transform=eval_tf)
+                ext_indices = np.arange(len(ext_samples))
+                ext_loader = create_dataloader(
+                    ext_dataset,
+                    ext_indices,
+                    batch_size=best_cfg.batch_size,
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                )
+                ext_logits, ext_labels = collect_logits_and_labels(model, ext_loader, device)
+                ext_probs_cal = softmax_with_temperature(ext_logits, temperature)
+                external_test_metrics = evaluate_with_threshold(
+                    probs=ext_probs_cal,
+                    labels=ext_labels,
+                    class_names=class_names,
+                    fake_idx=fake_idx,
+                    fake_threshold=fake_threshold,
+                )
+                external_test_metrics["num_samples"] = int(len(ext_samples))
+            else:
+                external_test_metrics = {"error": "No labeled images found under external test root."}
+        else:
+            external_test_metrics = {"error": "External test root directory not found."}
+
     results = {
         "date": str(datetime.date.today()),
         "dataset": {
@@ -696,6 +998,7 @@ def main():
             "optimizer": "AdamW",
             "scheduler": "CosineAnnealingLR",
         },
+        "data_sources": data_roots,
         "hyperparameter_sweep": comparison_rows,
         "best_config": {
             "name": best_cfg.name,
@@ -709,6 +1012,15 @@ def main():
         },
         "kfold_results": kfold_results,
         "final_test_metrics": test_metrics,
+        "thresholded_test_metrics": thresholded_test_metrics,
+        "calibration": {
+            "temperature": temperature,
+            "fake_class_index": fake_idx,
+            "fake_class_name": class_names[fake_idx],
+            "fake_threshold": fake_threshold,
+            "ood_confidence_threshold": ood_threshold,
+        },
+        "external_test_metrics": external_test_metrics,
         "training_history_best_config": best_result["history"],
         "graphs": {
             "training_curves": os.path.join("outputs", "graphs", "training_validation_curves.png"),
